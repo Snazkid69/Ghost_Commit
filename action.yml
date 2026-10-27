@@ -1,0 +1,16 @@
+name: 'GhostCommit - AI Logic Drift & Threat Hunter'
+description: 'Autonomous AI agent that detects runtime logic drift and mismatches between documentation and code implementation.'
+author: 'GhostCommit Team'
+
+inputs:
+  github-token:
+    description: 'GitHub Auth Token for reading PR diffs and posting comments'
+    required: true
+    default: '${{ github.token }}'
+  gemini-api-key:
+    description: 'Gemini API Key for semantic drift detection'
+    required: true
+
+runs:
+  using: 'node20'
+  main: 'src/index.js'

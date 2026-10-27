@@ -1,0 +1,145 @@
+const core = require('@actions/core');
+const github = require('@actions/github');
+const { GoogleGenAI } = require('@google/genai');
+
+/**
+ * Prompt setup for Semantic Logic Drift Analysis
+ */
+function buildDriftAnalysisPrompt(filename, patch) {
+  return `
+You are GhostCommit, an elite static code analyzer and semantic auditor. 
+Your job is to detect **Logic Drift**: discrepancies between intent (docstrings, comments, function names) and actual code behavior, plus silent runtime traps.
+
+Analyze the following file patch carefully:
+
+File: ${filename}
+Patch Context:
+\`\`\`diff
+${patch}
+\`\`\`
+
+Evaluate the code for:
+1. **Semantic Drift**: Does the implementation contradict comments, JSDoc, parameter annotations, or stated behavior?
+2. **Silent Runtime Traps**: Are there unhandled edge cases (e.g., unhandled null/undefined, type coercion risks, uncaught async errors)?
+3. **Ghost Bugs**: Subtle logic flaws that compile without error but produce incorrect output under specific conditions.
+
+Respond strictly in valid JSON format matching this schema:
+{
+  "driftScore": <number between 0 and 100>,
+  "hasDrift": <boolean>,
+  "summary": "<1-2 sentence overview of findings>",
+  "findings": [
+    {
+      "type": "<"Semantic Drift" | "Silent Trap" | "Ghost Bug">",
+      "issue": "<brief explanation>",
+      "suggestion": "<recommended code or doc fix>"
+    }
+  ]
+}
+`;
+}
+
+async function run() {
+  try {
+    const token = core.getInput('github-token');
+    const apiKey = core.getInput('gemini-api-key');
+
+    if (!apiKey) {
+      core.setFailed('Missing GEMINI_API_KEY secret.');
+      return;
+    }
+
+    const octokit = github.getOctokit(token);
+    const context = github.context;
+
+    // Only run on pull requests
+    if (context.eventName !== 'pull_request') {
+      core.info('GhostCommit only runs on pull_request events. Skipping.');
+      return;
+    }
+
+    const { owner, repo } = context.repo;
+    const pull_number = context.payload.pull_request.number;
+
+    core.info(`GhostCommit scanning PR #${pull_number} in ${owner}/${repo}...`);
+
+    // Fetch files changed in the PR
+    const { data: files } = await octokit.rest.pulls.listFiles({
+      owner,
+      repo,
+      pull_number,
+    });
+
+    const ai = new GoogleGenAI({ apiKey });
+    let totalAuditReport = [];
+
+    for (const file of files) {
+      // Ignore deleted files or non-code extensions
+      if (file.status === 'removed' || !file.patch) continue;
+      if (!/\.(js|ts|jsx|tsx|py|go|rs|java|cpp|c)$/i.test(file.filename)) continue;
+
+      core.info(`Analyzing file for logic drift: ${file.filename}`);
+
+      const prompt = buildDriftAnalysisPrompt(file.filename, file.patch);
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+        },
+      });
+
+      try {
+        const audit = JSON.parse(response.text);
+
+        if (audit.hasDrift || audit.driftScore > 20) {
+          totalAuditReport.push({
+            filename: file.filename,
+            ...audit
+          });
+        }
+      } catch (parseErr) {
+        core.warning(`Failed to parse AI output for ${file.filename}: ${parseErr.message}`);
+      }
+    }
+
+    // Post findings back to the PR if any logic drift was detected
+    if (totalAuditReport.length > 0) {
+      let commentBody = `## 👻 GhostCommit Logic Drift & Threat Report\n\n`;
+      commentBody += `GhostCommit detected potential semantic drift or silent traps in this PR.\n\n`;
+
+      for (const report of totalAuditReport) {
+        const scoreBadge = report.driftScore > 50 ? '⚠️ **HIGH**' : 'ℹ️ **MODERATE**';
+        commentBody += `### 📄 \`${report.filename}\` — Drift Risk: ${scoreBadge} (${report.driftScore}%)\n`;
+        commentBody += `> ${report.summary}\n\n`;
+
+        if (report.findings && report.findings.length > 0) {
+          commentBody += `| Type | Finding | Suggested Fix |\n`;
+          commentBody += `| :--- | :--- | :--- |\n`;
+          for (const item of report.findings) {
+            commentBody += `| **${item.type}** | ${item.issue} | \`${item.suggestion}\` |\n`;
+          }
+          commentBody += `\n`;
+        }
+        commentBody += `---\n`;
+      }
+
+      await octokit.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: pull_number,
+        body: commentBody
+      });
+
+      core.info('Successfully posted GhostCommit report to PR!');
+    } else {
+      core.info('No significant logic drift detected across PR files. All clear!');
+    }
+
+  } catch (error) {
+    core.setFailed(`GhostCommit failed: ${error.message}`);
+  }
+}
+
+run();
